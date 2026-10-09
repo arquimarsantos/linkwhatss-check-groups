@@ -1,16 +1,58 @@
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import mysql from 'mysql2/promise';
-import ftp from "basic-ftp";
-//import fs from 'fs/promises';
-import path from 'path';
+import ftp from 'basic-ftp';
 import UserAgent from 'user-agents';
 import { fileURLToPath } from 'url';
 
 puppeteer.use(StealthPlugin());
 
-//const __filename = fileURLToPath(import.meta.url);
-//const __dirname = path.dirname(__filename);
+const CONFIG = {
+    delayMin: 4000,
+    delayMax: 9000,
+
+    batchSizeMin: 15,
+    batchSizeMax: 30,
+    batchPauseMin: 30000,
+    batchPauseMax: 90000,
+
+    maxRetries: 4,
+    backoffBase: 30000,
+    backoffMax: 600000,
+
+    maxMultiplier: 6,
+
+    breakerThreshold: 3,
+    breakerCooldownMin: 300000,
+    breakerCooldownMax: 600000,
+    maxBreakerTrips: 3,
+
+    navTimeout: 60000
+};
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+const rand = (min, max) => Math.floor(min + Math.random() * (max - min));
+
+const humanRand = (min, max) =>
+    Math.floor(min + ((Math.random() + Math.random()) / 2) * (max - min));
+
+const fmt = ms => `${(ms / 1000).toFixed(1)}s`;
+
+class RateLimitError extends Error {
+    constructor(message, retryAfterMs = 0) {
+        super(message);
+        this.name = 'RateLimitError';
+        this.retryAfterMs = retryAfterMs;
+    }
+}
+
+class TransientError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'TransientError';
+    }
+}
 
 const pool = mysql.createPool({
     host: process.env.DB_HOST || 'localhost',
@@ -23,30 +65,8 @@ const pool = mysql.createPool({
     queueLimit: 0
 });
 
-const userAgent = new UserAgent({ deviceCategory: 'mobile' });
-
-async function optimizePage(page) {
-    await page.setRequestInterception(true);
-
-    page.on('request', request => {
-        const type = request.resourceType();
-
-        if (
-            type === 'image' ||
-            type === 'media' ||
-            type === 'font'
-        ) {
-            request.abort();
-        } else {
-            request.continue();
-        }
-    });
-}
-
 async function deleteImg(filename) {
-    if (!filename) {
-        return;
-    }
+    if (!filename) return;
 
     const client = new ftp.Client();
 
@@ -57,11 +77,8 @@ async function deleteImg(filename) {
             password: process.env.FTP_PASSWORD,
             secure: false
         });
-        
-        const filePath = `/domains/linkwhatss.com/public_html/img/groups/${filename}`;
 
-        await client.remove(filePath);
-
+        await client.remove(`/domains/linkwhatss.com/public_html/img/groups/${filename}`);
     } catch (err) {
         console.error(err);
     } finally {
@@ -70,17 +87,6 @@ async function deleteImg(filename) {
 }
 
 async function deleteGroup(group) {
-    /*
-    if (group.img) {
-        const imgPath = path.join(__dirname, '..', 'img', 'groups', group.img);
-
-        try {
-            await fs.access(imgPath);
-            await fs.unlink(imgPath);
-        } catch (e) {}
-    }
-    */
-
     await deleteImg(group.img);
 
     await pool.execute(
@@ -91,10 +97,156 @@ async function deleteGroup(group) {
     console.log(`${group.name} foi removido!`);
 }
 
+async function optimizePage(page) {
+    await page.setRequestInterception(true);
+
+    page.on('request', request => {
+        const type = request.resourceType();
+
+        if (type === 'image' || type === 'media' || type === 'font') {
+            request.abort();
+        } else {
+            request.continue();
+        }
+    });
+}
+
+async function startSession() {
+    const browser = await puppeteer.launch({
+        headless: true,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-extensions',
+            '--disable-background-networking',
+            '--disable-sync',
+            '--no-first-run',
+            '--disable-default-apps',
+            '--disable-features=Translate,BackForwardCache',
+            '--mute-audio',
+            '--hide-scrollbars',
+            '--disable-popup-blocking'
+        ]
+    });
+
+    const page = await browser.newPage();
+    await optimizePage(page);
+    await page.setUserAgent(new UserAgent({ deviceCategory: 'mobile' }).toString());
+
+    return { browser, page };
+}
+
+async function closeSession(session) {
+    if (!session?.browser) return;
+    try {
+        await session.browser.close();
+    } catch (e) {}
+}
+
+function createThrottle() {
+    return {
+        multiplier: 1,
+        consecutiveRateLimits: 0,
+        breakerTrips: 0,
+
+        onSuccess() {
+            this.consecutiveRateLimits = 0;
+            this.multiplier = Math.max(1, this.multiplier * 0.9);
+        },
+
+        onRateLimit() {
+            this.consecutiveRateLimits++;
+            this.multiplier = Math.min(
+                CONFIG.maxMultiplier,
+                this.multiplier * 1.5 + 0.5
+            );
+        },
+
+        nextDelay() {
+            return Math.floor(
+                humanRand(CONFIG.delayMin, CONFIG.delayMax) * this.multiplier
+            );
+        },
+
+        backoff(attempt, retryAfterMs = 0) {
+            const exp = Math.min(
+                CONFIG.backoffMax,
+                CONFIG.backoffBase * 2 ** (attempt - 1)
+            );
+            const jittered = rand(exp * 0.75, exp * 1.25);
+            return Math.min(CONFIG.backoffMax, Math.max(jittered, retryAfterMs));
+        }
+    };
+}
+
+async function checkGroup(page, group) {
+    let response;
+
+    try {
+        response = await page.goto(group.link, {
+            waitUntil: 'domcontentloaded',
+            timeout: CONFIG.navTimeout
+        });
+    } catch (err) {
+        throw new TransientError(`Falha de navegação: ${err.message}`);
+    }
+
+    const status = response?.status();
+
+    if (status === 429) {
+        const header = response.headers()['retry-after'];
+        let retryAfterMs = 0;
+
+        if (header) {
+            const secs = Number(header);
+            retryAfterMs = Number.isFinite(secs)
+                ? secs * 1000
+                : Math.max(0, new Date(header).getTime() - Date.now()) || 0;
+        }
+
+        throw new RateLimitError('HTTP 429 (Too Many Requests)', retryAfterMs);
+    }
+
+    if (status >= 500) {
+        throw new TransientError(`HTTP ${status}`);
+    }
+
+    return page.evaluate(() => {
+        const metaTitle = document.querySelector('meta[property="og:title"]');
+
+        if (metaTitle) {
+            const title = metaTitle.content.trim();
+
+            if (title === '') return false;
+
+            if (
+                title.includes('Convite para grupo') ||
+                title.includes('WhatsApp Group Invite')
+            ) {
+                return false;
+            }
+
+            return true;
+        }
+
+        const h3Title = document.querySelector('h3._9vd5._9scr');
+
+        if (h3Title && h3Title.innerText.trim() === '') return false;
+
+        return true;
+    });
+}
+
 export async function runChecker() {
-    let browser;
+    let session = null;
     let total = 0;
     let removed = 0;
+    let skipped = 0;
+    let aborted = false;
+
+    const throttle = createThrottle();
 
     try {
         const [groups] = await pool.execute(`
@@ -110,99 +262,109 @@ export async function runChecker() {
 
         console.log(`${groups.length} grupos para verificar`);
 
-        browser = await puppeteer.launch({
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-extensions',
-                '--disable-background-networking',
-                '--disable-sync',
-                '--no-first-run',
-                '--disable-default-apps',
-                '--disable-features=Translate,BackForwardCache',
-                '--mute-audio',
-                '--hide-scrollbars',
-                '--disable-popup-blocking'
-            ]
-        });
+        session = await startSession();
 
-        const page = await browser.newPage();
+        let sinceBatchPause = 0;
+        let batchSize = rand(CONFIG.batchSizeMin, CONFIG.batchSizeMax + 1);
 
-        await optimizePage(page);
-        
-        await page.setUserAgent(userAgent.toString());
-
+        groupLoop:
         for (const group of groups) {
             total++;
 
             console.log(
-                `\n[${total}/${groups.length}] Verificando: ${group.name}`
+                `\n[${total}/${groups.length}] Verificando: ${group.name} ` +
+                `(x${throttle.multiplier.toFixed(2)})`
             );
 
-            try {
-                await page.goto(group.link, {
-                    waitUntil: 'domcontentloaded',
-                    timeout: 60000
-                });
+            let result = null;
 
-                const isValid = await page.evaluate(() => {
-                    const metaTitle = document.querySelector(
-                        'meta[property="og:title"]'
-                    );
+            for (let attempt = 1; attempt <= CONFIG.maxRetries + 1; attempt++) {
+                try {
+                    result = await checkGroup(session.page, group);
+                    throttle.onSuccess();
+                    break;
+                } catch (err) {
+                    const isRateLimit = err instanceof RateLimitError;
 
-                    if (metaTitle) {
-                        const title = metaTitle.content.trim();
-
-                        if (title === '') {
-                            return false;
-                        }
-
-                        if (
-                            title.includes('Convite para grupo') ||
-                            title.includes('WhatsApp Group Invite')
-                        ) {
-                            return false;
-                        }
-
-                        return true;
+                    if (isRateLimit) {
+                        throttle.onRateLimit();
+                        console.warn(`Rate limit detectado (tentativa ${attempt}).`);
+                    } else {
+                        console.warn(`Erro temporário (tentativa ${attempt}): ${err.message}`);
                     }
 
-                    const h3Title = document.querySelector(
-                        'h3._9vd5._9scr'
-                    );
+                    if (isRateLimit && throttle.consecutiveRateLimits >= CONFIG.breakerThreshold) {
+                        throttle.breakerTrips++;
 
-                    if (h3Title && h3Title.innerText.trim() === '') {
-                        return false;
+                        if (throttle.breakerTrips > CONFIG.maxBreakerTrips) {
+                            console.error('Muitos bloqueios seguidos. Abortando; o restante fica para a próxima execução.');
+                            aborted = true;
+                            skipped += groups.length - total + 1;
+                            break groupLoop;
+                        }
+
+                        const cooldown = rand(
+                            CONFIG.breakerCooldownMin,
+                            CONFIG.breakerCooldownMax
+                        );
+
+                        console.warn(
+                            `Circuit breaker ativado. Esfriando por ${fmt(cooldown)} ` +
+                            `e reiniciando navegador (${throttle.breakerTrips}/${CONFIG.maxBreakerTrips}).`
+                        );
+
+                        await closeSession(session);
+                        session = null;
+                        await sleep(cooldown);
+                        session = await startSession();
+                        throttle.consecutiveRateLimits = 0;
+                        continue;
                     }
 
-                    return true;
-                });
+                    if (attempt > CONFIG.maxRetries) break;
 
-                if (!isValid) {
-                    await deleteGroup(group);
-                    removed++;
+                    const wait = isRateLimit ? throttle.backoff(attempt, err.retryAfterMs) : Math.min(15000 * attempt, 60000) + rand(0, 5000);
+
+                    console.log(`Aguardando ${fmt(wait)} antes de tentar de novo...`);
+                    await sleep(wait);
                 }
+            }
 
-                await new Promise(resolve => setTimeout(resolve, 2000));
-            } catch (err) {
-                console.error(err);
+            if (result === null) {
+                skipped++;
+                console.warn(`Não foi possível verificar "${group.name}". Mantido.`);
+            } else if (result === false) {
+                await deleteGroup(group);
+                removed++;
+            }
+
+            const delay = throttle.nextDelay();
+            console.log(`Delay: ${fmt(delay)}`);
+            await sleep(delay);
+
+            sinceBatchPause++;
+            if (sinceBatchPause >= batchSize && total < groups.length) {
+                const pause = Math.floor(
+                    humanRand(CONFIG.batchPauseMin, CONFIG.batchPauseMax) *
+                    Math.max(1, throttle.multiplier / 2)
+                );
+                console.log(`Pausa de lote: ${fmt(pause)}`);
+                await sleep(pause);
+
+                sinceBatchPause = 0;
+                batchSize = rand(CONFIG.batchSizeMin, CONFIG.batchSizeMax + 1);
             }
         }
     } catch (e) {
         console.error(e);
     } finally {
-        if (browser) {
-            try {
-                await browser.close();
-            } catch (e) {}
-        }
+        await closeSession(session);
 
         console.log('\n==============================================');
         console.log(`Total verificados: ${total}`);
         console.log(`Total removidos: ${removed}`);
+        console.log(`Não verificados (mantidos): ${skipped}`);
+        if (aborted) console.log('Execução abortada por bloqueios do WhatsApp');
         console.log('==============================================\n');
     }
 }
