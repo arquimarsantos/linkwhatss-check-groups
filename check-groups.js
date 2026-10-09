@@ -9,8 +9,8 @@ import { fileURLToPath } from 'url';
 
 puppeteer.use(StealthPlugin());
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+//const __filename = fileURLToPath(import.meta.url);
+//const __dirname = path.dirname(__filename);
 
 const pool = mysql.createPool({
     host: process.env.DB_HOST || 'localhost',
