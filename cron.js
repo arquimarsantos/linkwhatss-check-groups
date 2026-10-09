@@ -4,7 +4,8 @@ import { runChecker } from './check-groups.js';
 let isCheckerRunning = false;
 
 async function executeChecker() {
-    if (isCheckerRunning || isScraperRunning) {
+    if (isCheckerRunning) {
+        console.log('Checagem anterior ainda em andamento, ignorando.');
         return;
     }
     
